@@ -1,0 +1,173 @@
+name: Build Windows installer (Ostadhi)
+
+# Runs on every push to main (and by hand from the Actions tab).
+# Result: Ostadhi-Setup-<version>.exe  (Actions > Artifacts, and repository > Releases).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Flat repository: every file sits at the root. We put them in the right folders.
+      - name: Prepare project folders
+        run: |
+          mkdir -p lib assets/sounds assets/google_fonts
+          rm -f lock_gate.dart app_lock.dart pin_screen.dart
+          mv -f ./*.dart lib/ 2>/dev/null || true
+          # Desktop version of the start-up code (SQLite through FFI) replaces the Android stub.
+          cp -f lib/desktop_init_windows.dart lib/desktop_init.dart
+          rm -f lib/desktop_init_windows.dart
+          if [ -f success.wav ]; then mv -f success.wav assets/sounds/success.wav; fi
+          [ -f assets/google_fonts/README.txt ] || echo "Cairo fonts (optional)" > assets/google_fonts/README.txt
+          if [ ! -f assets/sounds/success.wav ]; then
+            python - <<'PY'
+          import wave, struct, math
+          sr=44100; n=int(sr*1.5)
+          notes=[(523.25,0.0),(659.25,0.11),(783.99,0.22),(1046.5,0.33)]
+          s=[0.0]*n
+          for f,st in notes:
+              o=int(st*sr)
+              for i in range(o,n):
+                  t=(i-o)/sr
+                  env=math.exp(-3.0*t)*min(1.0,t/0.004)
+                  s[i]+=(math.sin(2*math.pi*f*t)+0.3*math.sin(4*math.pi*f*t)+0.1*math.sin(6*math.pi*f*t))*env
+          k=0.85/max(abs(x) for x in s)
+          w=wave.open('assets/sounds/success.wav','wb')
+          w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+          w.writeframes(b''.join(struct.pack('<h',int(x*k*32767)) for x in s))
+          w.close()
+          PY
+          fi
+
+      - name: Generate Windows scaffolding
+        run: |
+          mkdir /tmp/keep && cp -r pubspec.yaml lib assets /tmp/keep/
+          flutter create --org com.teacher --project-name math_teacher --platforms windows .
+          cp /tmp/keep/pubspec.yaml pubspec.yaml
+          rm -rf lib assets && cp -r /tmp/keep/lib lib && cp -r /tmp/keep/assets assets
+          rm -rf test
+          # SQLite for Windows (the Android build does not need it)
+          flutter pub add sqflite_common_ffi
+
+      # App name (Ostadhi.exe), window title and size, icon.
+      - name: Branding (name, window, icon)
+        run: |
+          sed -i 's/set(BINARY_NAME "math_teacher")/set(BINARY_NAME "Ostadhi")/' windows/CMakeLists.txt
+          sed -i 's/L"math_teacher"/L"Ostadhi"/' windows/runner/main.cpp
+          sed -i 's/Size size(1280, 720)/Size size(1000, 760)/' windows/runner/main.cpp
+          sed -i 's/math_teacher/Ostadhi/g' windows/runner/Runner.rc
+          grep -n "BINARY_NAME" windows/CMakeLists.txt | head -3
+          if [ -f icon.png ]; then
+            pip install --quiet pillow
+            python - <<'PY'
+          from PIL import Image
+          img = Image.open('icon.png').convert('RGBA')
+          img.save('windows/runner/resources/app_icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          img.save('icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          PY
+          fi
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Windows release
+        run: flutter build windows --release --build-number=${{ github.run_number }} --build-name=1.9.${{ github.run_number }}
+
+      # The app needs sqlite3.dll and the Visual C++ runtime next to Ostadhi.exe.
+      - name: Add runtime DLLs
+        run: |
+          R=build/windows/x64/runner/Release
+          ls "$R" | head -30
+          if [ ! -f "$R/sqlite3.dll" ]; then
+            F=$(find "$HOME" "$LOCALAPPDATA/Pub/Cache" "$PUB_CACHE" -name sqlite3.dll 2>/dev/null | head -1)
+            if [ -n "$F" ]; then
+              cp "$F" "$R/sqlite3.dll"
+            else
+              curl -fsSL -o /tmp/sqlite.zip https://www.sqlite.org/2025/sqlite-dll-win-x64-3500100.zip
+              unzip -o /tmp/sqlite.zip sqlite3.dll -d "$R"
+            fi
+          fi
+          for d in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+            [ -f "$R/$d" ] || cp "/c/Windows/System32/$d" "$R/" 2>/dev/null || true
+          done
+          ls -la "$R/sqlite3.dll" "$R/Ostadhi.exe"
+
+      # Inno Setup builds the installer (Ostadhi-Setup-x.y.z.exe).
+      - name: Write installer script
+        shell: pwsh
+        run: |
+          @'
+          #define MyAppName "Ostadhi"
+          [Setup]
+          AppId={{B6B1A1C2-5D6E-4F2A-9C1B-0A1B2C3D4E5F}
+          AppName={#MyAppName}
+          AppVersion={#AppVersion}
+          AppPublisher=Ostadhi
+          DefaultDirName={autopf}\Ostadhi
+          DefaultGroupName=Ostadhi
+          UninstallDisplayIcon={app}\Ostadhi.exe
+          OutputDir=installer
+          OutputBaseFilename=Ostadhi-Setup-{#AppVersion}
+          Compression=lzma2
+          SolidCompression=yes
+          PrivilegesRequired=lowest
+          WizardStyle=modern
+          SetupIconFile=icon.ico
+          [Languages]
+          Name: "french"; MessagesFile: "compiler:Languages\French.isl"
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+          [Files]
+          Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Icons]
+          Name: "{group}\Ostadhi"; Filename: "{app}\Ostadhi.exe"
+          Name: "{autodesktop}\Ostadhi"; Filename: "{app}\Ostadhi.exe"; Tasks: desktopicon
+          [Run]
+          Filename: "{app}\Ostadhi.exe"; Description: "{cm:LaunchProgram,Ostadhi}"; Flags: nowait postinstall skipifsilent
+          '@ | Set-Content -Path installer.iss -Encoding UTF8
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=1.9.${{ github.run_number }}" installer.iss
+          Get-ChildItem installer
+
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ostadhi-windows-installer
+          path: installer/Ostadhi-Setup-1.9.${{ github.run_number }}.exe
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-v1.9.${{ github.run_number }}
+          name: Ostadhi Windows v1.9.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: installer/Ostadhi-Setup-1.9.${{ github.run_number }}.exe
+          generate_release_notes: true
